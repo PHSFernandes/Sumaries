@@ -1,11 +1,15 @@
 import io
 import re
 import html
+import base64
 import zipfile
 import unicodedata
 import pandas as pd
 import streamlit as st
 import weasyprint
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 st.set_page_config(
     page_title="Sumários em Atraso - Coordenação",
@@ -55,6 +59,118 @@ def detect_year_from_filename(filename: str) -> str:
     if match and match.group(1) in YEAR_OPTIONS:
         return match.group(1)
     return '2025-26'
+
+
+def generate_pareto_chart_base64(ct: pd.DataFrame, titulo_periodo: str) -> tuple[str, str]:
+    s = ct['Total'].sort_values(ascending=False)
+    total_sumarios = int(s.sum())
+    n_docentes = len(s)
+
+    if total_sumarios == 0 or n_docentes == 0:
+        return "", ""
+
+    cum_sum = s.cumsum()
+    cum_pct = (cum_sum / total_sumarios) * 100.0
+
+    # Identifica docentes até atingir/ultrapassar a barreira dos 80%
+    vital_mask = []
+    reached_80 = False
+    for pct in cum_pct:
+        if not reached_80:
+            vital_mask.append(True)
+            if pct >= 80.0:
+                reached_80 = True
+        else:
+            vital_mask.append(False)
+
+    n_vital = sum(vital_mask)
+    pct_docentes_vital = (n_vital / n_docentes) * 100.0
+    pct_sumarios_vital = float(cum_pct.iloc[n_vital - 1])
+
+    resumo_pareto = (
+        f"Regra de Pareto (80/20): <strong>{n_vital} de {n_docentes} docentes "
+        f"({pct_docentes_vital:.1f}%)</strong> concentram "
+        f"<strong>{int(cum_sum.iloc[n_vital - 1])} de {total_sumarios} sumários em atraso "
+        f"({pct_sumarios_vital:.1f}%)</strong>."
+    )
+
+    # Ordenação invertida para exibir o maior no topo do gráfico horizontal
+    s_plot = s.iloc[::-1]
+    cum_plot = cum_pct.iloc[::-1]
+    colors_plot = ['#1e3a5f' if m else '#94a3b8' for m in reversed(vital_mask)]
+
+    fig_height = max(4.2, min(8.8, 0.33 * n_docentes + 1.6))
+    fig, ax1 = plt.subplots(figsize=(8.2, fig_height), dpi=220)
+
+    y_pos = range(len(s_plot))
+    bars = ax1.barh(y_pos, s_plot.values, color=colors_plot, height=0.68, edgecolor='none', zorder=2)
+
+    ax1.set_yticks(list(y_pos))
+    ax1.set_yticklabels(s_plot.index, fontsize=7.2, color='#111827')
+    ax1.set_xlabel("Número de Sumários em Atraso", fontsize=8, fontweight='bold', color='#1e3a5f')
+    ax1.tick_params(axis='x', labelsize=7.5, colors='#334155')
+    ax1.set_xlim(0, max(s_plot.values) * 1.18)
+    ax1.grid(axis='x', linestyle=':', linewidth=0.6, color='#cbd5e1', zorder=1)
+    ax1.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False)
+
+    # Eixo superior para o % acumulado
+    ax2 = ax1.twiny()
+    ax2.plot(
+        cum_plot.values,
+        list(y_pos),
+        color='#d97706',
+        marker='o',
+        markersize=3.8,
+        linewidth=1.5,
+        label='% Acumulado',
+        zorder=4,
+    )
+    ax2.axvline(80.0, color='#dc2626', linestyle='--', linewidth=1.1, zorder=3, label='Corte 80%')
+    ax2.set_xlim(0, 108)
+    ax2.set_xlabel("Percentual Acumulado (%)", fontsize=8, fontweight='bold', color='#b45309')
+    ax2.tick_params(axis='x', labelsize=7.5, colors='#b45309')
+    ax2.spines['right'].set_visible(False)
+
+    # Rótulos de valor + % acumulado à direita de cada barra
+    for bar, val, pct in zip(bars, s_plot.values, cum_plot.values):
+        ax1.text(
+            val + (max(s_plot.values) * 0.015),
+            bar.get_y() + bar.get_height() / 2,
+            f"{int(val)} ({pct:.1f}%)",
+            va='center',
+            ha='left',
+            fontsize=6.6,
+            color='#0f172a',
+            fontweight='bold',
+        )
+
+    ax2.text(
+        80.8,
+        len(s_plot) - 0.55,
+        "80%",
+        color='#dc2626',
+        fontsize=7.2,
+        fontweight='bold',
+        va='top',
+    )
+
+    plt.title(
+        f"Diagrama de Pareto — Concentração por Docente ({titulo_periodo})",
+        fontsize=9.5,
+        fontweight='bold',
+        color='#1e3a5f',
+        pad=26,
+        loc='left',
+    )
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight')
+    plt.close(fig)
+
+    img_b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+    return img_b64, resumo_pareto
 
 
 CSS_DOCENTE = """
@@ -314,6 +430,35 @@ tr.total-row td {
     border-bottom: 1.2pt solid #475569;
     padding: 5.5pt 4pt;
 }
+
+.pareto-section {
+    page-break-before: always;
+    break-before: page;
+    padding-top: 4pt;
+}
+
+.pareto-summary {
+    background-color: #eef2f7;
+    border-left: 3.5px solid #1e3a5f;
+    padding: 6pt 9pt;
+    font-size: 8.5pt;
+    color: #0f172a;
+    margin-bottom: 8pt;
+}
+
+.pareto-legend {
+    font-size: 7.5pt;
+    color: #475569;
+    margin-bottom: 6pt;
+}
+
+.pareto-img {
+    width: 100%;
+    height: auto;
+    border: 0.5pt solid #cbd5e1;
+    padding: 4pt;
+    background-color: #ffffff;
+}
 """
 
 
@@ -436,7 +581,12 @@ def build_docente_pdf(
     return weasyprint.HTML(string=full_html).write_pdf()
 
 
-def build_gerencial_pdf(ct: pd.DataFrame, titulo_periodo: str, cursos_presentes: list[str]) -> bytes:
+def build_gerencial_pdf(
+    ct: pd.DataFrame,
+    titulo_periodo: str,
+    cursos_presentes: list[str],
+    incluir_pareto: bool = True,
+) -> bytes:
     totals = ct.sum(axis=0)
     rows_html = []
 
@@ -459,6 +609,21 @@ def build_gerencial_pdf(ct: pd.DataFrame, titulo_periodo: str, cursos_presentes:
     total_cells.append("<td class='col-num'>—</td>")
     total_cells.append("<td class='col-num'>—</td>")
     rows_html.append(f"<tr class='total-row'>{''.join(total_cells)}</tr>")
+
+    pareto_html = ""
+    if incluir_pareto:
+        img_b64, resumo_pareto = generate_pareto_chart_base64(ct, titulo_periodo)
+        if img_b64:
+            pareto_html = f"""
+            <div class="pareto-section">
+                <div class="pareto-summary">{resumo_pareto}</div>
+                <div class="pareto-legend">
+                    Barras azul-escuras: docentes prioritários que compõem até ~80% do volume acumulado &nbsp;|&nbsp;
+                    Linha laranja: percentual acumulado &nbsp;|&nbsp; Linha tracejada vermelha: corte de 80%.
+                </div>
+                <img class="pareto-img" src="data:image/png;base64,{img_b64}" alt="Diagrama de Pareto">
+            </div>
+            """
 
     cursos_str = ", ".join(cursos_presentes)
     full_html = f"""<!DOCTYPE html>
@@ -490,6 +655,8 @@ def build_gerencial_pdf(ct: pd.DataFrame, titulo_periodo: str, cursos_presentes:
             {''.join(rows_html)}
         </tbody>
     </table>
+
+    {pareto_html}
 </body>
 </html>
 """
@@ -521,6 +688,7 @@ def generate_all_artifacts(
     sub: pd.DataFrame,
     anos_alvo: list[str],
     todos_anos: bool,
+    incluir_pareto: bool = True,
 ):
     if sub.empty:
         return None, None, {}, b"", ""
@@ -545,7 +713,7 @@ def generate_all_artifacts(
     cursos_ordenados = [c for c in COURSE_ORDER if c in sub['Curso'].values] + sorted(
         set(sub['Curso'].unique()) - set(COURSE_ORDER)
     )
-    gerencial_bytes = build_gerencial_pdf(ct, titulo_periodo, cursos_ordenados)
+    gerencial_bytes = build_gerencial_pdf(ct, titulo_periodo, cursos_ordenados, incluir_pareto)
 
     individual_pdfs = {}
     zip_buffer = io.BytesIO()
@@ -647,9 +815,9 @@ if uploaded_files:
         anos_presentes = sorted(df_consolidado['Ano'].dropna().astype(str).unique().tolist())
 
         st.divider()
-        st.subheader("2. Período dos Reports")
+        st.subheader("2. Período e Opções do Report Gerencial")
 
-        col_mode, col_year = st.columns([1.2, 1])
+        col_mode, col_year, col_pareto = st.columns([1.2, 1, 1])
         with col_mode:
             modo_geracao = st.radio(
                 "Modo de geração dos Reports",
@@ -671,6 +839,12 @@ if uploaded_files:
                     index=default_ano_idx,
                 )
                 anos_alvo = [ano_escolhido]
+
+        with col_pareto:
+            incluir_pareto_flag = st.checkbox(
+                "Incluir Diagrama de Pareto (80/20) no Report Gerencial",
+                value=True,
+            )
 
         sub_periodo = prepare_filtered_data(df_consolidado, anos_alvo)
 
@@ -721,7 +895,7 @@ if uploaded_files:
 
                 with st.spinner("A gerar relatórios em PDF..."):
                     ct, gerencial_bytes, individual_pdfs, zip_bytes, tag_arq = generate_all_artifacts(
-                        sub_final, anos_alvo, todos_anos_flag
+                        sub_final, anos_alvo, todos_anos_flag, incluir_pareto_flag
                     )
 
                 st.divider()
