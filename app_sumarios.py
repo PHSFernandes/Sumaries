@@ -12,7 +12,9 @@ st.set_page_config(
     layout="wide",
 )
 
+COURSE_OPTIONS = ['MIMV', 'LCB', 'LEV', 'Outro...']
 COURSE_ORDER = ['MIMV', 'LCB', 'LEV']
+YEAR_OPTIONS = ['2024-25', '2025-26', '2026-27', '2027-28', 'Outro...']
 STATES_ORDER = [
     'Por Lançar',
     'Por Lançar (Expirado)',
@@ -38,6 +40,21 @@ def safe_filename(name: str) -> str:
     nfkd = unicodedata.normalize('NFKD', str(name))
     ascii_str = "".join(c for c in nfkd if not unicodedata.combining(c))
     return re.sub(r'[^A-Za-z0-9]+', '_', ascii_str).strip('_')
+
+
+def detect_course_from_filename(filename: str) -> str:
+    upper = filename.upper()
+    for c in COURSE_ORDER:
+        if re.search(rf'(^|[^A-Z0-9]){c}([^A-Z0-9]|$)', upper):
+            return c
+    return 'MIMV'
+
+
+def detect_year_from_filename(filename: str) -> str:
+    match = re.search(r'(20\d{2}-\d{2})', filename)
+    if match and match.group(1) in YEAR_OPTIONS:
+        return match.group(1)
+    return '2025-26'
 
 
 CSS_DOCENTE = """
@@ -317,7 +334,7 @@ def build_docente_pdf(df_doc: pd.DataFrame, docente: str, ano_letivo: str) -> by
         rows_html = []
         for _, r in df_c.iterrows():
             uc = html.escape(str(r['Unidade Curricular/Turma']))
-            dt_oc = html.escape(str(r['Data Ocupação']))
+            dt_oc = html.escape(str(r['Data_Fmt']))
             hr = html.escape(str(r['Hora']))
             est = html.escape(str(r['Estado']))
             rows_html.append(
@@ -387,7 +404,7 @@ def build_docente_pdf(df_doc: pd.DataFrame, docente: str, ano_letivo: str) -> by
     return weasyprint.HTML(string=full_html).write_pdf()
 
 
-def build_gerencial_pdf(ct: pd.DataFrame, ano_letivo: str) -> bytes:
+def build_gerencial_pdf(ct: pd.DataFrame, ano_letivo: str, cursos_presentes: list[str]) -> bytes:
     totals = ct.sum(axis=0)
     rows_html = []
 
@@ -411,7 +428,7 @@ def build_gerencial_pdf(ct: pd.DataFrame, ano_letivo: str) -> bytes:
     total_cells.append("<td class='col-num'>—</td>")
     rows_html.append(f"<tr class='total-row'>{''.join(total_cells)}</tr>")
 
-    cursos_str = ", ".join(COURSE_ORDER)
+    cursos_str = ", ".join(cursos_presentes)
     full_html = f"""<!DOCTYPE html>
 <html lang="pt">
 <head>
@@ -447,14 +464,23 @@ def build_gerencial_pdf(ct: pd.DataFrame, ano_letivo: str) -> bytes:
     return weasyprint.HTML(string=full_html).write_pdf()
 
 
-@st.cache_data(show_spinner=False)
-def generate_all_artifacts(file_bytes: bytes, sheet_name: str, ano_letivo: str):
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name)
-    sub = df[(df['Ano'].astype(str) == str(ano_letivo)) & (df['Estado'] != 'Lançado')].copy()
-    if sub.empty:
-        return None, None, {}
+def generate_all_artifacts(df_all: pd.DataFrame, ano_letivo: str):
+    sub = df_all[
+        (df_all['Ano'].astype(str).str.strip() == str(ano_letivo).strip())
+        & (df_all['Estado'].astype(str).str.strip() != 'Lançado')
+    ].copy()
 
-    sub['dt_sort'] = pd.to_datetime(sub['Data Ocupação'], format='%d-%m-%Y', errors='coerce')
+    if sub.empty:
+        return None, None, {}, b""
+
+    sub['Docente'] = sub['Docente'].astype(str).str.strip()
+    sub['Estado'] = sub['Estado'].astype(str).str.strip()
+    sub['Curso'] = sub['Curso'].astype(str).str.strip().str.upper()
+    sub['Hora'] = sub['Hora'].astype(str).str.strip()
+    sub['Unidade Curricular/Turma'] = sub['Unidade Curricular/Turma'].astype(str).str.strip()
+
+    sub['dt_sort'] = pd.to_datetime(sub['Data Ocupação'], dayfirst=True, errors='coerce')
+    sub['Data_Fmt'] = sub['dt_sort'].dt.strftime('%d-%m-%Y').fillna(sub['Data Ocupação'].astype(str).str.strip())
 
     ct = pd.crosstab(sub['Docente'], sub['Estado'])
     for st_name in STATES_ORDER:
@@ -463,7 +489,10 @@ def generate_all_artifacts(file_bytes: bytes, sheet_name: str, ano_letivo: str):
     ct = ct[STATES_ORDER].sort_index()
     ct['Total'] = ct.sum(axis=1)
 
-    gerencial_bytes = build_gerencial_pdf(ct, ano_letivo)
+    cursos_ordenados = [c for c in COURSE_ORDER if c in sub['Curso'].values] + sorted(
+        set(sub['Curso'].unique()) - set(COURSE_ORDER)
+    )
+    gerencial_bytes = build_gerencial_pdf(ct, ano_letivo, cursos_ordenados)
 
     individual_pdfs = {}
     zip_buffer = io.BytesIO()
@@ -480,73 +509,136 @@ def generate_all_artifacts(file_bytes: bytes, sheet_name: str, ano_letivo: str):
 
 st.title("Reports de Sumários em Atraso")
 
-uploaded_file = st.file_uploader(
-    "Carregar ficheiro Excel consolidado (.xlsx)",
-    type=["xlsx"],
+uploaded_files = st.file_uploader(
+    "Carregar ficheiros Excel por curso/ano (.xlsx)",
+    type=["xlsx", "xls"],
+    accept_multiple_files=True,
 )
 
-if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
-    xls = pd.ExcelFile(io.BytesIO(file_bytes))
-    default_sheet_idx = xls.sheet_names.index("Planilha1") if "Planilha1" in xls.sheet_names else 0
+if uploaded_files:
+    st.subheader("Configuração dos ficheiros carregados")
+    dfs_list = []
 
-    col_cfg1, col_cfg2 = st.columns(2)
-    with col_cfg1:
-        sheet_selected = st.selectbox("Aba de dados", xls.sheet_names, index=default_sheet_idx)
+    for idx, up_file in enumerate(uploaded_files):
+        file_bytes = up_file.getvalue()
+        xls = pd.ExcelFile(io.BytesIO(file_bytes))
+        default_sheet_idx = xls.sheet_names.index("Planilha1") if "Planilha1" in xls.sheet_names else 0
 
-    df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_selected)
-    anos_disponiveis = sorted(df_raw['Ano'].dropna().astype(str).unique().tolist())
-    default_ano_idx = anos_disponiveis.index("2025-26") if "2025-26" in anos_disponiveis else 0
+        detected_course = detect_course_from_filename(up_file.name)
+        detected_year = detect_year_from_filename(up_file.name)
 
-    with col_cfg2:
-        ano_selected = st.selectbox("Ano Letivo", anos_disponiveis, index=default_ano_idx)
+        with st.container(border=True):
+            st.markdown(f"**Ficheiro {idx + 1}:** `{up_file.name}`")
+            c1, c2, c3 = st.columns([1.2, 1, 1])
 
-    with st.spinner("A gerar relatórios em PDF..."):
-        res = generate_all_artifacts(file_bytes, sheet_selected, ano_selected)
+            with c1:
+                sheet_sel = st.selectbox(
+                    "Aba",
+                    xls.sheet_names,
+                    index=default_sheet_idx,
+                    key=f"sheet_{idx}_{up_file.name}",
+                )
 
-    if res[0] is None:
-        st.warning(f"Não existem sumários pendentes para o ano {ano_selected}.")
-    else:
-        ct, gerencial_bytes, individual_pdfs, zip_bytes = res
+            with c2:
+                curso_choice = st.selectbox(
+                    "Curso",
+                    COURSE_OPTIONS,
+                    index=COURSE_OPTIONS.index(detected_course),
+                    key=f"curso_{idx}_{up_file.name}",
+                )
+                if curso_choice == 'Outro...':
+                    curso_val = st.text_input(
+                        "Sigla do Curso",
+                        value="",
+                        key=f"curso_custom_{idx}_{up_file.name}",
+                    ).strip().upper()
+                else:
+                    curso_val = curso_choice
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Docentes com Pendências", len(ct))
-        m2.metric("Total Sumários em Atraso", int(ct['Total'].sum()))
-        m3.metric("Por Lançar", int(ct['Por Lançar'].sum()))
-        expirados_total = int(ct['Por Lançar (Expirado)'].sum() + ct['Pré-lançado (Expirado)'].sum() + ct['Faltou'].sum())
-        m4.metric("Expirados / Faltou", expirados_total)
+            with c3:
+                ano_choice = st.selectbox(
+                    "Ano Letivo",
+                    YEAR_OPTIONS,
+                    index=YEAR_OPTIONS.index(detected_year),
+                    key=f"ano_{idx}_{up_file.name}",
+                )
+                if ano_choice == 'Outro...':
+                    ano_val = st.text_input(
+                        "Ano (ex: 2027-28)",
+                        value="",
+                        key=f"ano_custom_{idx}_{up_file.name}",
+                    ).strip()
+                else:
+                    ano_val = ano_choice
+
+        if curso_val and ano_val:
+            df_part = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_sel)
+            df_part['Curso'] = curso_val
+            df_part['Ano'] = ano_val
+            dfs_list.append(df_part)
+
+    if dfs_list:
+        df_consolidado = pd.concat(dfs_list, ignore_index=True)
+        anos_presentes = sorted(df_consolidado['Ano'].dropna().astype(str).unique().tolist())
+        default_ano_report_idx = anos_presentes.index("2025-26") if "2025-26" in anos_presentes else 0
 
         st.divider()
+        ano_report = st.selectbox(
+            "Ano Letivo para geração dos Reports",
+            anos_presentes,
+            index=default_ano_report_idx,
+        )
 
-        dl1, dl2 = st.columns(2)
-        with dl1:
-            st.download_button(
-                label=f"Baixar Report Gerencial (PDF — {len(ct)} docentes)",
-                data=gerencial_bytes,
-                file_name=f"Report_Gerencial_Sumarios_Atraso_{ano_selected}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-                type="primary",
-            )
-        with dl2:
-            st.download_button(
-                label=f"Baixar Todos os PDFs por Docente (ZIP — {len(individual_pdfs)} ficheiros)",
-                data=zip_bytes,
-                file_name=f"Sumarios_em_Atraso_{ano_selected}_Por_Docente.zip",
-                mime="application/zip",
-                use_container_width=True,
+        with st.spinner("A gerar relatórios em PDF..."):
+            ct, gerencial_bytes, individual_pdfs, zip_bytes = generate_all_artifacts(
+                df_consolidado, ano_report
             )
 
-        st.subheader("Pré-visualização — Quadro Gerencial")
-        st.dataframe(ct, use_container_width=True)
-
-        st.subheader("Download Individual por Docente")
-        doc_escolhido = st.selectbox("Selecionar docente", list(individual_pdfs.keys()))
-        if doc_escolhido:
-            fname_ind, bytes_ind = individual_pdfs[doc_escolhido]
-            st.download_button(
-                label=f"Baixar PDF — {doc_escolhido}",
-                data=bytes_ind,
-                file_name=fname_ind,
-                mime="application/pdf",
+        if ct is None:
+            st.warning(f"Não existem sumários pendentes para o ano {ano_report}.")
+        else:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Docentes com Pendências", len(ct))
+            m2.metric("Total Sumários em Atraso", int(ct['Total'].sum()))
+            m3.metric("Por Lançar", int(ct['Por Lançar'].sum()))
+            expirados_total = int(
+                ct['Por Lançar (Expirado)'].sum()
+                + ct['Pré-lançado (Expirado)'].sum()
+                + ct['Faltou'].sum()
             )
+            m4.metric("Expirados / Faltou", expirados_total)
+
+            st.divider()
+
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button(
+                    label=f"Baixar Report Gerencial (PDF — {len(ct)} docentes)",
+                    data=gerencial_bytes,
+                    file_name=f"Report_Gerencial_Sumarios_Atraso_{ano_report}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    type="primary",
+                )
+            with dl2:
+                st.download_button(
+                    label=f"Baixar Todos os PDFs por Docente (ZIP — {len(individual_pdfs)} ficheiros)",
+                    data=zip_bytes,
+                    file_name=f"Sumarios_em_Atraso_{ano_report}_Por_Docente.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+
+            st.subheader("Pré-visualização — Quadro Gerencial")
+            st.dataframe(ct, use_container_width=True)
+
+            st.subheader("Download Individual por Docente")
+            doc_escolhido = st.selectbox("Selecionar docente", list(individual_pdfs.keys()))
+            if doc_escolhido:
+                fname_ind, bytes_ind = individual_pdfs[doc_escolhido]
+                st.download_button(
+                    label=f"Baixar PDF — {doc_escolhido}",
+                    data=bytes_ind,
+                    file_name=fname_ind,
+                    mime="application/pdf",
+                )
